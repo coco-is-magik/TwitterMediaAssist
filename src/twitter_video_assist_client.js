@@ -196,8 +196,14 @@ async function downloadMediaObject(event) {
         media.referencedBy === mainTweetId
     );
 
+    const sent = new Set()
     relatedMedia.forEach(media => {
-        browser.runtime.sendMessage(media);
+        const key = mediaKey(media)
+        if (sent.has(key)) return
+        sent.add(key)
+        browser.runtime.sendMessage(media).then(response => {
+            if (response?.error) console.warn('Media download failed', response.error)
+        }).catch(error => console.warn('Media download failed', error));
     });
 }
 

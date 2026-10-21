@@ -1,26 +1,57 @@
-let readableNameList = {}
-const fileNameRegex = /([\w,\s-.]+\.[A-Za-z]{2,4}$)/
+const activeDownloads = new Map()
 
-function chromeDownloadRenamer(item, suggest) {
-    if (!item.byExtensionId || item.byExtensionId !== chrome.runtime.id) {
-        return
+function mediaKey(media) {
+    const url = new URL(media.url)
+    url.hash = ''
+    // Delivery tags and image sizes do not identify different attachments.
+    if (url.hostname === 'video.twimg.com' || url.hostname === 'pbs.twimg.com') {
+        for (const name of ['tag', 'name']) url.searchParams.delete(name)
     }
+    url.searchParams.sort()
+    return `${media.type}:${url.href}`
+}
 
-    if (!Object.keys(readableNameList).length) {
-        return
-    }
+function downloadFile(options, objectUrl = false) {
+    return new Promise((resolve, reject) => {
+        let id
+        let settled = false
+        function finish(error) {
+            if (settled) return
+            settled = true
+            browser.downloads.onChanged.removeListener(onChanged)
+            browser.downloads.onErased.removeListener(onErased)
+            if (objectUrl) URL.revokeObjectURL(options.url)
+            if (error) reject(error)
+            else resolve(id)
+        }
+        function onChanged(delta) {
+            if (id === undefined || delta.id !== id) return
+            if (delta.state?.current === 'complete') finish()
+            else if (delta.state?.current === 'interrupted') finish(new Error('Download interrupted'))
+        }
+        function onErased(erasedId) {
+            if (id !== undefined && erasedId === id) finish(new Error('Download removed'))
+        }
+        browser.downloads.onChanged.addListener(onChanged)
+        browser.downloads.onErased.addListener(onErased)
+        Promise.resolve().then(() => browser.downloads.download(options)).then(downloadId => {
+            id = downloadId
+            // A small download can finish before download() resolves with its ID.
+            return browser.downloads.search({ id })
+        }).then(items => {
+            if (!items.length) finish(new Error('Download removed'))
+            else onChanged({ id, state: { current: items[0].state } })
+        }).catch(finish)
+    })
+}
 
-    let result = fileNameRegex.exec(item.filename)
-    const filename = result[1]
-    const suggestFilename = readableNameList[filename] || item.filename
-    const replacedFilePath = item.filename.replace(fileNameRegex, suggestFilename)
-    delete readableNameList[filename]
-
-    suggest({ filename: replacedFilePath, conflictAction: "uniquify" })
-
-    if (!Object.keys(readableNameList).length) {
-        chrome.downloads.onDeterminingFilename.removeListener(chromeDownloadRenamer)
-    }
+function downloadMediaFile(media, makeOptions) {
+    const key = mediaKey(media)
+    if (activeDownloads.has(key)) return activeDownloads.get(key)
+    const task = Promise.resolve().then(makeOptions).then(options => downloadFile(options))
+        .finally(() => activeDownloads.delete(key))
+    activeDownloads.set(key, task)
+    return task
 }
 
 function processBlobVideo(id, readableName, token) {
@@ -39,17 +70,18 @@ function processBlobVideo(id, readableName, token) {
 }
 
 function processGifVideo({ url, readableFilename }) {
-    browser.storage.sync.get({
+    return browser.storage.sync.get({
         isConvertGIF: true,
         isSaveMP4: true,
     }).then((items) => {
-        if (items.isConvertGIF) {
-            convertGif(url, readableFilename)
-        }
-
-        if (items.isSaveMP4) {
-            downloadMp4Video({ url, readableFilename })
-        }
+        const tasks = []
+        if (items.isConvertGIF) tasks.push(convertGif(url, readableFilename))
+        if (items.isSaveMP4) tasks.push(downloadMp4Video({ url, readableFilename }))
+        // Keep the request locked until both outputs settle, even if one fails.
+        return Promise.all(tasks.map(task => task.then(() => null, error => error))).then(errors => {
+            const error = errors.find(Boolean)
+            if (error) throw error
+        })
     })
 }
 
@@ -96,7 +128,7 @@ function getMaximumBitrate(videoSources) {
 
 function refineImageSourceParams(src) {
     const url = new URL(src);
-    const searchParams = new URLSearchParams(url);
+    const searchParams = url.searchParams;
     searchParams.set('name', 'orig')
     url.search = searchParams
 
@@ -418,7 +450,7 @@ function mergeFragment(buffer, fragment) {
 }
 
 function downloadTsVideo(data, tsFilename, readableName) {
-    browser.storage.sync.get({
+    return browser.storage.sync.get({
         spcificPathName: false,
         readableName: false
     }).then((items) => {
@@ -437,7 +469,7 @@ function downloadTsVideo(data, tsFilename, readableName) {
             options.filename = readableName + '.ts'
         }
 
-        browser.downloads.download(options)
+        return downloadFile(options, true)
     })
 }
 
@@ -447,7 +479,7 @@ function fileExtension(url) {
 }
 
 function downloadMp4Video({ url, readableFilename }) {
-    browser.storage.sync.get({
+    return downloadMediaFile({ type: 'video', url }, () => browser.storage.sync.get({
         spcificPathName: false,
         readableName: false
     }).then((items) => {
@@ -460,57 +492,26 @@ function downloadMp4Video({ url, readableFilename }) {
             options.filename = readableFilename + '.' + fileExtension(url)
         }
 
-        browser.downloads.download(options)
-    })
+        return options
+    }))
 }
 
 function downloadImage({ url, readableFilename }) {
-    browser.storage.sync.get({
+    return downloadMediaFile({ type: 'image', url }, () => browser.storage.sync.get({
         spcificPathName: false,
         readableName: false
     }).then((items) => {
-        const uploadedImageQuery = /https:\/\/pbs.twimg.com\/media\/(.*)?\?.*/g
-        const fileNameRegex = /([^/\\&\?]+)(\.\w{2,4})(?=([\?&].*$|$))/
-
-        const nameMatches = uploadedImageQuery.exec(url)
-        const filenameMatches = fileNameRegex.exec(url)
-
-        let options = {
+        const source = new URL(url)
+        const basename = source.pathname.substring(source.pathname.lastIndexOf('/') + 1)
+        const match = /^(.*)\.(\w{2,4})$/.exec(basename)
+        const format = source.searchParams.get('format') || (match ? match[2] : 'jpg')
+        const filename = items.readableName ? readableFilename : (match ? match[1] : basename)
+        return {
             url: url,
-            saveAs: items.spcificPathName
+            saveAs: items.spcificPathName,
+            filename: `${filename}.${format}`
         }
-
-        let filename = 'no_title'
-        const format = filenameMatches[2] || ".jpg"
-
-        if (nameMatches.length) {
-            filename = nameMatches[1]
-        }
-
-        if (!!items.readableName) {
-            if (!!chrome.downloads.onDeterminingFilename) {
-                readableNameList[`${filename}`] = `${readableFilename}${format} `
-
-                if (!!chrome.downloads.onDeterminingFilename && !isRenamerActivated()) {
-                    chrome.downloads.onDeterminingFilename.addListener(chromeDownloadRenamer)
-                }
-            }
-            filename = readableFilename
-        }
-
-        if (filenameMatches.length) {
-            options.filename = `${filename}${format}`
-        }
-
-        browser.downloads.download(options)
-            .then((_downloadItem) => {
-                if (!!chrome.downloads.onDeterminingFilename) {
-                    if (!Object.keys(readableNameList).length) {
-                        chrome.downloads.onDeterminingFilename.removeListener(chromeDownloadRenamer)
-                    }
-                }
-            })
-    })
+    }))
 }
 
 function getCookie(cname) {
@@ -577,8 +578,4 @@ function parseVideoUrls(string) {
         }
     }
     return arrPlaylist
-}
-
-function isRenamerActivated() {
-    return chrome.downloads.onDeterminingFilename.hasListener(chromeDownloadRenamer)
 }
